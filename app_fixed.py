@@ -4,6 +4,7 @@ import pandas as pd
 from scipy.stats import norm
 import plotly.graph_objects as go
 import plotly.express as px
+import yfinance as yf
 # FIX #13: Removed unused imports `make_subplots` and `io`
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -318,14 +319,73 @@ def render_regime_bot():
             label_counts[base] += 1
         return [regime_map[s] for s in states], regime_map
 
+    # Popular stock suggestions grouped by category
+    POPULAR_STOCKS = {
+        "Tech": ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "AMD", "INTC", "ORCL"],
+        "Finance": ["JPM", "GS", "BAC", "WFC", "MS", "C", "BLK", "AXP", "V", "MA"],
+        "Energy": ["XOM", "CVX", "COP", "SLB", "EOG", "PXD", "MPC", "PSX", "VLO", "HAL"],
+        "Healthcare": ["JNJ", "UNH", "PFE", "MRK", "ABBV", "LLY", "TMO", "ABT", "BMY", "AMGN"],
+        "ETFs": ["SPY", "QQQ", "IWM", "DIA", "GLD", "TLT", "VTI", "VNQ", "XLF", "XLE"],
+        "Indices": ["^GSPC", "^IXIC", "^DJI", "^RUT", "^VIX"],
+        "Crypto": ["BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "ADA-USD"],
+    }
+
     col_ctrl, col_chart = st.columns([1, 2.8], gap="large")
 
     with col_ctrl:
         st.markdown("### 📂 Data Source")
-        data_src = st.radio("", ["📥 Upload CSV", "🎲 Synthetic Data"], label_visibility="collapsed")
+        data_src = st.radio("", ["📡 Live Stock Data", "📥 Upload CSV", "🎲 Synthetic Data"], label_visibility="collapsed")
 
         df = None
-        if data_src == "📥 Upload CSV":
+        if data_src == "📡 Live Stock Data":
+            st.markdown(
+                '<div class="info-box">Fetches real OHLCV data via <b>Yahoo Finance</b> — no API key needed. '
+                'Supports stocks, ETFs, indices, and crypto.</div>',
+                unsafe_allow_html=True
+            )
+
+            # Quick-pick buttons by category
+            st.markdown("**Quick Pick**")
+            category = st.selectbox("Category", list(POPULAR_STOCKS.keys()), key="cat")
+            quick_pick = st.selectbox("Symbol", POPULAR_STOCKS[category], key="qp")
+
+            # Free-text input — pre-filled from quick pick
+            ticker_input = st.text_input(
+                "Or type any ticker (e.g. NFLX, TSM, UBER)",
+                value=quick_pick,
+                key="ticker_txt"
+            ).strip().upper()
+
+            period_map = {
+                "6 months": "6mo",
+                "1 year":   "1y",
+                "2 years":  "2y",
+                "5 years":  "5y",
+                "10 years": "10y",
+                "Max":      "max",
+            }
+            period_label = st.selectbox("History", list(period_map.keys()), index=2)
+            period = period_map[period_label]
+
+            if ticker_input:
+                with st.spinner(f"Fetching {ticker_input} …"):
+                    try:
+                        raw = yf.download(ticker_input, period=period, auto_adjust=True, progress=False)
+                        if raw.empty:
+                            st.error(f"No data found for **{ticker_input}**. Check the ticker symbol.")
+                        else:
+                            # yfinance may return MultiIndex columns — flatten
+                            if isinstance(raw.columns, pd.MultiIndex):
+                                raw.columns = raw.columns.get_level_values(0)
+                            raw.index = pd.to_datetime(raw.index)
+                            df = raw[['Close']].dropna()
+                            st.success(f"✅ {ticker_input} — {len(df):,} trading days loaded ({period_label})")
+                            st.caption(f"Latest close: **${df['Close'].iloc[-1]:.2f}**  |  "
+                                       f"Range: {df.index[0].date()} → {df.index[-1].date()}")
+                    except Exception as e:
+                        st.error(f"Failed to fetch data: {e}")
+
+        elif data_src == "📥 Upload CSV":
             st.markdown(
                 '<div class="info-box">CSV must have <b>Date</b> and <b>Close</b> columns.</div>',
                 unsafe_allow_html=True
