@@ -712,7 +712,7 @@ with st.sidebar:
     <div style="text-align:center; padding: 20px 0 16px 0;">
         <div style="font-size:32px">📊</div>
         <div style="font-size:17px; font-weight:700; color:#f0f6fc; margin-top:6px">Quant Bot Suite</div>
-        <div style="font-size:11px; color:#8b949e; margin-top:2px">by tubakhxn</div>
+        <div style="font-size:11px; color:#8b949e; margin-top:2px">by aj1m153</div>
     </div>
     <hr style="border-color:#21262d; margin:0 0 16px 0">
     """, unsafe_allow_html=True)
@@ -733,9 +733,9 @@ with st.sidebar:
         📐 Black-Scholes · Scipy<br>
         🤖 HMM · hmmlearn<br>
         🌲 Scikit-learn · Plotly<br><br>
-        <a href="https://github.com/tubakhxn/Delta-Gamma-Risk-Surface-Bot"      target="_blank" style="color:#58a6ff">Delta-Gamma Bot ↗</a><br>
-        <a href="https://github.com/tubakhxn/Latent-Regime-Detection-Bot"       target="_blank" style="color:#58a6ff">Regime Bot ↗</a><br>
-        <a href="https://github.com/tubakhxn/Volatility-Surface-Forecasting-Bot" target="_blank" style="color:#58a6ff">Vol Surface Bot ↗</a>
+        <a href="https://github.com/aj1m153/Delta-Gamma-Risk-Surface-Bot"      target="_blank" style="color:#58a6ff">Delta-Gamma Bot ↗</a><br>
+        <a href="https://github.com/aj1m153/Latent-Regime-Detection-Bot"       target="_blank" style="color:#58a6ff">Regime Bot ↗</a><br>
+        <a href="https://github.com/aj1m153/Volatility-Surface-Forecasting-Bot" target="_blank" style="color:#58a6ff">Vol Surface Bot ↗</a>
     </div>
     """, unsafe_allow_html=True)
 
