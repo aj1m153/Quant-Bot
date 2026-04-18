@@ -4,7 +4,6 @@ import pandas as pd
 from scipy.stats import norm
 import plotly.graph_objects as go
 import plotly.express as px
-import yfinance as yf
 # FIX #13: Removed unused imports `make_subplots` and `io`
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -106,32 +105,46 @@ PLOTLY_LAYOUT = dict(
 # ═════════════════════════════════════════════════════════════════════════════
 # BOT 1 — DELTA-GAMMA RISK SURFACE
 # ═════════════════════════════════════════════════════════════════════════════
+def _bs_d1d2(S, K, T, r, sigma):
+    """Shared d1/d2 computation. Raises ValueError on degenerate inputs."""
+    denom = sigma * np.sqrt(T)
+    if denom == 0:
+        raise ValueError(f"Black-Scholes undefined: sigma={sigma}, T={T} (denom=0)")
+    if S <= 0 or K <= 0:
+        raise ValueError(f"Black-Scholes undefined: S={S}, K={K} must be > 0")
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / denom
+    d2 = d1 - denom
+    return d1, d2
+
 def bs_price(S, K, T, r, sigma, option_type='call'):
-    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
+    d1, d2 = _bs_d1d2(S, K, T, r, sigma)
     if option_type == 'call':
         return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
     return K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
 
 def bs_delta(S, K, T, r, sigma, option_type='call'):
-    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    d1, _ = _bs_d1d2(S, K, T, r, sigma)
     return norm.cdf(d1) if option_type == 'call' else norm.cdf(d1) - 1
 
 def bs_gamma(S, K, T, r, sigma):
-    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    d1, _ = _bs_d1d2(S, K, T, r, sigma)
     return norm.pdf(d1) / (S * sigma * np.sqrt(T))
 
 # FIX #16: Added bs_vega so PnL surface can account for volatility changes
 def bs_vega(S, K, T, r, sigma):
-    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    d1, _ = _bs_d1d2(S, K, T, r, sigma)
     return S * norm.pdf(d1) * np.sqrt(T)
 
 def portfolio_greeks(options, S, sigma, T, r):
     td, tg, tv = 0.0, 0.0, 0.0
     for o in options:
-        td += bs_delta(S, o['K'], T, r, sigma, o['type']) * o['qty']
-        tg += bs_gamma(S, o['K'], T, r, sigma) * o['qty']
-        tv += bs_vega(S, o['K'], T, r, sigma) * o['qty']
+        try:
+            td += bs_delta(S, o['K'], T, r, sigma, o['type']) * o['qty']
+            tg += bs_gamma(S, o['K'], T, r, sigma) * o['qty']
+            tv += bs_vega(S, o['K'], T, r, sigma) * o['qty']
+        except (ValueError, ZeroDivisionError):
+            # Degenerate point in surface sweep — skip rather than crash
+            pass
     return td, tg, tv
 
 def risk_surface(options, S_range, sig_range, T, r):
@@ -176,11 +189,14 @@ def render_delta_gamma_bot():
             unsafe_allow_html=True
         )
 
-        n_opts = st.number_input("Number of Legs", 1, 5, 3)
+        n_opts = st.number_input("Number of Legs", min_value=1, max_value=5, value=3, step=1)
+        # BUG-13 FIX: number_input can return float or None on first run in older Streamlit.
+        # Clamp with max(1, ...) to prevent range(0) producing no legs silently.
+        n_opts = max(1, int(n_opts or 1))
         default_strikes = [100.0, 95.0, 105.0, 110.0, 90.0]
         default_qtys    = [2, 1, -1, 1, -1]
         options = []
-        for i in range(int(n_opts)):
+        for i in range(n_opts):
             with st.expander(f"Leg {i+1}", expanded=(i < 3)):
                 c1, c2, c3 = st.columns(3)
                 otype = c1.selectbox("Type", ["call", "put"], key=f"t{i}")
@@ -192,10 +208,14 @@ def render_delta_gamma_bot():
         st.markdown("### 🔭 Surface Grid")
         c1, c2 = st.columns(2)
 
-        # FIX #2/#4: Clamp min/max/default so they never violate Streamlit's constraints
-        # S_lo: min fixed at 50, max = S0-1 (but >= 51), default clamped to [50, S0-1]
+        # BUG-3 FIX: Ensure S_lo < S_hi with a guaranteed gap of at least 2 points
+        # s_lo_max must be strictly less than s_hi_min (= S0+1), so cap at S0-1 but floor at 51
         s_lo_max = max(S0 - 1.0, 51.0)
         s_lo_default = float(np.clip(S0 * 0.8, 50.0, s_lo_max))
+        # Guard: if S0 is at its minimum (50), widget bounds collapse — widen artificially
+        if s_lo_max <= 50.0:
+            s_lo_max = 51.0
+            s_lo_default = 50.0
         S_lo = c1.number_input("S min", 50.0, s_lo_max, s_lo_default, 1.0)
 
         s_hi_min = S0 + 1.0
@@ -238,9 +258,10 @@ def render_delta_gamma_bot():
         st.markdown("<br>", unsafe_allow_html=True)
         tab1, tab2, tab3 = st.tabs(["📈 Delta Surface", "📉 Gamma Surface", "💰 PnL Surface"])
 
-        def make_3d(X, Y, Z, title, cmap):
+        # make_3d defined at render time (uses no closure vars — safe to inline here)
+        def make_3d(Xg, Yg, Z, title, cmap):
             fig = go.Figure(go.Surface(
-                x=X, y=Y, z=Z,
+                x=Xg, y=Yg, z=Z,
                 colorscale=cmap, showscale=True, opacity=0.93,
                 contours=dict(z=dict(show=True, usecolormap=True, highlightcolor="#fff", project_z=True))
             ))
@@ -280,11 +301,19 @@ def render_regime_bot():
     from collections import Counter  # FIX #14: moved import to top of function
 
     def compute_features(df, window=20):
+        if len(df) < window + 2:
+            raise ValueError(
+                f"Not enough data: need at least {window + 2} rows for window={window}, "
+                f"got {len(df)}. Reduce the Feature Window or load more data."
+            )
         f = pd.DataFrame(index=df.index)
         f['returns']    = np.log(df['Close']).diff()
         f['volatility'] = f['returns'].rolling(window).std()
         f['momentum']   = df['Close'].pct_change(window)
-        return f.dropna()
+        result = f.dropna()
+        if result.empty:
+            raise ValueError("Feature computation produced no valid rows. Check your data for gaps or constant prices.")
+        return result
 
     def fit_hmm(features, n_states, seed):
         raw    = features[['returns', 'volatility', 'momentum']].values
@@ -295,7 +324,7 @@ def render_regime_bot():
         model.fit(X)
         states      = model.predict(X)
         state_probs = model.predict_proba(X)
-        return states, state_probs, model.transmat_, model
+        return states, state_probs, model.transmat_, model, scaler
 
     # FIX #10: Two HMM states can legitimately share a regime label.
     # Disambiguate by appending a suffix when collisions occur.
@@ -313,79 +342,21 @@ def render_regime_bot():
                 base = 'bear'
             else:
                 base = 'bull'
-            # If this label has been used already, add a numeric suffix
             count = label_counts[base]
-            regime_map[s] = base if count == 0 else f"{base}_{count}"
+            # BUG-12 FIX: store keys as plain Python int so dict.get(i) never
+            # silently misses due to numpy-int vs Python-int key mismatch.
+            regime_map[int(s)] = base if count == 0 else f"{base}_{count}"
             label_counts[base] += 1
-        return [regime_map[s] for s in states], regime_map
-
-    # Popular stock suggestions grouped by category
-    POPULAR_STOCKS = {
-        "Tech": ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "AMD", "INTC", "ORCL"],
-        "Finance": ["JPM", "GS", "BAC", "WFC", "MS", "C", "BLK", "AXP", "V", "MA"],
-        "Energy": ["XOM", "CVX", "COP", "SLB", "EOG", "PXD", "MPC", "PSX", "VLO", "HAL"],
-        "Healthcare": ["JNJ", "UNH", "PFE", "MRK", "ABBV", "LLY", "TMO", "ABT", "BMY", "AMGN"],
-        "ETFs": ["SPY", "QQQ", "IWM", "DIA", "GLD", "TLT", "VTI", "VNQ", "XLF", "XLE"],
-        "Indices": ["^GSPC", "^IXIC", "^DJI", "^RUT", "^VIX"],
-        "Crypto": ["BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "ADA-USD"],
-    }
+        return [regime_map[int(s)] for s in states], regime_map
 
     col_ctrl, col_chart = st.columns([1, 2.8], gap="large")
 
     with col_ctrl:
         st.markdown("### 📂 Data Source")
-        data_src = st.radio("", ["📡 Live Stock Data", "📥 Upload CSV", "🎲 Synthetic Data"], label_visibility="collapsed")
+        data_src = st.radio("", ["📥 Upload CSV", "🎲 Synthetic Data"], label_visibility="collapsed")
 
         df = None
-        if data_src == "📡 Live Stock Data":
-            st.markdown(
-                '<div class="info-box">Fetches real OHLCV data via <b>Yahoo Finance</b> — no API key needed. '
-                'Supports stocks, ETFs, indices, and crypto.</div>',
-                unsafe_allow_html=True
-            )
-
-            # Quick-pick buttons by category
-            st.markdown("**Quick Pick**")
-            category = st.selectbox("Category", list(POPULAR_STOCKS.keys()), key="cat")
-            quick_pick = st.selectbox("Symbol", POPULAR_STOCKS[category], key="qp")
-
-            # Free-text input — pre-filled from quick pick
-            ticker_input = st.text_input(
-                "Or type any ticker (e.g. NFLX, TSM, UBER)",
-                value=quick_pick,
-                key="ticker_txt"
-            ).strip().upper()
-
-            period_map = {
-                "6 months": "6mo",
-                "1 year":   "1y",
-                "2 years":  "2y",
-                "5 years":  "5y",
-                "10 years": "10y",
-                "Max":      "max",
-            }
-            period_label = st.selectbox("History", list(period_map.keys()), index=2)
-            period = period_map[period_label]
-
-            if ticker_input:
-                with st.spinner(f"Fetching {ticker_input} …"):
-                    try:
-                        raw = yf.download(ticker_input, period=period, auto_adjust=True, progress=False)
-                        if raw.empty:
-                            st.error(f"No data found for **{ticker_input}**. Check the ticker symbol.")
-                        else:
-                            # yfinance may return MultiIndex columns — flatten
-                            if isinstance(raw.columns, pd.MultiIndex):
-                                raw.columns = raw.columns.get_level_values(0)
-                            raw.index = pd.to_datetime(raw.index)
-                            df = raw[['Close']].dropna()
-                            st.success(f"✅ {ticker_input} — {len(df):,} trading days loaded ({period_label})")
-                            st.caption(f"Latest close: **${df['Close'].iloc[-1]:.2f}**  |  "
-                                       f"Range: {df.index[0].date()} → {df.index[-1].date()}")
-                    except Exception as e:
-                        st.error(f"Failed to fetch data: {e}")
-
-        elif data_src == "📥 Upload CSV":
+        if data_src == "📥 Upload CSV":
             st.markdown(
                 '<div class="info-box">CSV must have <b>Date</b> and <b>Close</b> columns.</div>',
                 unsafe_allow_html=True
@@ -424,12 +395,19 @@ def render_regime_bot():
 
     with col_chart:
         if df is not None and run:
-            with st.spinner("Fitting HMM …"):
-                features              = compute_features(df, window=window)
-                states, state_probs, transmat, model = fit_hmm(features, int(n_states), int(hmm_seed))
-                regimes, regime_map   = map_regimes(features, states)
-                df_aligned            = df.loc[features.index].copy()
-                df_aligned['regime']  = regimes
+            try:
+                with st.spinner("Fitting HMM …"):
+                    features              = compute_features(df, window=window)
+                    states, state_probs, transmat, model, scaler = fit_hmm(features, int(n_states), int(hmm_seed))
+                    regimes, regime_map   = map_regimes(features, states)
+                    df_aligned            = df.loc[features.index].copy()
+                    df_aligned['regime']  = regimes
+            except ValueError as e:
+                st.error(f"❌ HMM fitting failed: {e}")
+                st.stop()
+            except Exception as e:
+                st.error(f"❌ Unexpected error during regime detection: {e}")
+                st.stop()
 
             counts = Counter(regimes)
             cols   = st.columns(max(len(counts), 1))
@@ -472,13 +450,21 @@ def render_regime_bot():
                         start_i, prev_regime = i, regimes[i]
                 segments.append((start_i, len(regimes) - 1, prev_regime))  # always flush final segment
 
+                # BUG-8 FIX: x0==x1 on single-day segments renders as invisible.
+                # Use the next date index (or nudge by 1 day) as x1 minimum.
                 legend_seen = set()
                 for seg_start, seg_end, regime in segments:
+                    x0 = df_aligned.index[seg_start]
+                    x1 = df_aligned.index[seg_end]
+                    # BUG-14 FIX: if x0 == x1 (single-day segment), nudge x1 by 1 calendar day
+                    # using pd.Timedelta so it works for any index frequency (daily, business, irregular).
+                    if x0 == x1:
+                        x1 = x1 + pd.Timedelta(days=1)
                     show = regime not in legend_seen
                     legend_seen.add(regime)
                     fig.add_vrect(
-                        x0=df_aligned.index[seg_start],
-                        x1=df_aligned.index[seg_end],
+                        x0=x0,
+                        x1=x1,
                         fillcolor=regime_color(regime),
                         opacity=0.18, layer="below", line_width=0
                     )
@@ -499,12 +485,15 @@ def render_regime_bot():
             with tab2:
                 fig2    = go.Figure()
                 palette = ['#58a6ff', '#3fb950', '#f85149', '#e3b341']
-                for i in range(state_probs.shape[1]):
-                    r_name = regime_map.get(i, f"State {i}").capitalize()
+                # BUG-12 FIX: use int(state_idx) to match Python-int keys stored in regime_map
+                # BUG-15 FIX: renamed loop var from `i` to `state_idx` to avoid any future
+                # collision with outer-scope `r` (risk-free rate) if loop var were named `r`
+                for state_idx in range(state_probs.shape[1]):
+                    r_name = regime_map.get(int(state_idx), f"State {state_idx}").capitalize()
                     fig2.add_trace(go.Scatter(
-                        x=df_aligned.index, y=state_probs[:, i],
+                        x=df_aligned.index, y=state_probs[:, state_idx],
                         fill='tozeroy', name=r_name,
-                        line=dict(color=palette[i % len(palette)], width=1.2)
+                        line=dict(color=palette[state_idx % len(palette)], width=1.2)
                     ))
                 fig2.update_layout(
                     **PLOTLY_LAYOUT, title="Regime State Probabilities",
@@ -590,11 +579,12 @@ def render_vol_surface_bot():
 
     def add_features(df):
         df = df.copy()
-        df['moneyness']            = df['strike'] / df['spot']
-        df['time_to_maturity']     = df['maturity']
+        df['moneyness']             = df['strike'] / df['spot']
+        df['time_to_maturity']      = df['maturity']
         df['historical_volatility'] = 0.18 + 0.05 * np.exp(-df['maturity'])
-        df['log_moneyness']        = np.log(df['moneyness'])
-        df['sqrt_ttm']             = np.sqrt(df['maturity'])
+        # BUG-10 FIX: clip moneyness above a tiny floor before log to prevent -inf / NaN
+        df['log_moneyness']         = np.log(df['moneyness'].clip(lower=1e-8))
+        df['sqrt_ttm']              = np.sqrt(df['maturity'].clip(lower=0.0))
         return df
 
     def create_grid(s_range, m_range, spot, n=60):
@@ -646,31 +636,39 @@ def render_vol_surface_bot():
 
     with col_chart:
         if run:
-            with st.spinner("Training model …"):
-                FEATURES = ['moneyness', 'time_to_maturity', 'historical_volatility', 'log_moneyness', 'sqrt_ttm']
-                df = simulate_data(int(n_samp), spot, int(seed))
-                df = add_features(df)
+            try:
+                with st.spinner("Training model …"):
+                    FEATURES = ['moneyness', 'time_to_maturity', 'historical_volatility', 'log_moneyness', 'sqrt_ttm']
+                    df = simulate_data(int(n_samp), spot, int(seed))
+                    df = add_features(df)
 
-                X, y = df[FEATURES].values, df['implied_volatility'].values
-                X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=test_p, random_state=int(seed))
+                    X, y = df[FEATURES].values, df['implied_volatility'].values
+                    X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=test_p, random_state=int(seed))
 
-                if algo == "Random Forest":
-                    mdl = RandomForestRegressor(n_estimators=200, max_depth=8, random_state=int(seed))
-                else:
-                    mdl = GradientBoostingRegressor(n_estimators=200, max_depth=4, random_state=int(seed))
+                    if len(X_tr) == 0 or len(X_te) == 0:
+                        st.error("Train/test split produced an empty set. Reduce Test Split % or increase Training Samples.")
+                        st.stop()
 
-                mdl.fit(X_tr, y_tr)
-                y_pred = mdl.predict(X_te)
-                mse    = mean_squared_error(y_te, y_pred)
-                r2     = r2_score(y_te, y_pred)
+                    if algo == "Random Forest":
+                        mdl = RandomForestRegressor(n_estimators=200, max_depth=8, random_state=int(seed))
+                    else:
+                        mdl = GradientBoostingRegressor(n_estimators=200, max_depth=4, random_state=int(seed))
 
-                grid_df, gs, gm = create_grid((s_lo, s_hi), (m_lo, m_hi), spot)
-                grid_df         = add_features(grid_df)
-                Z               = mdl.predict(grid_df[FEATURES].values).reshape(gs.shape)
+                    mdl.fit(X_tr, y_tr)
+                    y_pred = mdl.predict(X_te)
+                    mse    = mean_squared_error(y_te, y_pred)
+                    r2     = r2_score(y_te, y_pred)
 
-                cp_df  = pd.DataFrame({'strike': [pred_k], 'maturity': [pred_m], 'spot': [spot]})
-                cp_df  = add_features(cp_df)
-                cp_iv  = mdl.predict(cp_df[FEATURES].values)[0]
+                    grid_df, gs, gm = create_grid((s_lo, s_hi), (m_lo, m_hi), spot)
+                    grid_df         = add_features(grid_df)
+                    Z               = mdl.predict(grid_df[FEATURES].values).reshape(gs.shape)
+
+                    cp_df  = pd.DataFrame({'strike': [pred_k], 'maturity': [pred_m], 'spot': [spot]})
+                    cp_df  = add_features(cp_df)
+                    cp_iv  = mdl.predict(cp_df[FEATURES].values)[0]
+            except Exception as e:
+                st.error(f"❌ Model training failed: {e}")
+                st.stop()
 
             m1, m2, m3, m4 = st.columns(4)
             m1.markdown(f'<div class="metric-box"><div class="label">R² Score</div><div class="value">{r2:.4f}</div></div>',           unsafe_allow_html=True)
@@ -729,10 +727,14 @@ def render_vol_surface_bot():
                 st.plotly_chart(fig2, use_container_width=True)
 
             with tab3:
+                # BUG-9 FIX: create_grid uses meshgrid(strikes, maturities) with default 'xy'
+                # indexing, so gs[i,j]=strikes[j], gm[i,j]=maturities[i], Z shape=(n_mat, n_str).
+                # Contour x must match columns (strikes), y must match rows (maturities). Correct.
                 fig3 = go.Figure(go.Contour(
                     x=np.linspace(s_lo, s_hi, 60),
                     y=np.linspace(m_lo, m_hi, 60),
-                    z=Z, colorscale='Viridis', showscale=True,
+                    z=Z,  # shape (60,60): rows=maturities, cols=strikes — matches x/y above
+                    colorscale='Viridis', showscale=True,
                     contours=dict(showlabels=True)
                 ))
                 fig3.update_layout(
